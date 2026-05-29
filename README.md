@@ -84,6 +84,4 @@ innodb_undrop/
     logging_setup.py     # Logging configuration
 ```
 
-## License
 
-MIT License
