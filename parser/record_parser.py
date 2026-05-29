@@ -13,7 +13,7 @@ from utils.config import (
     UNIV_PAGE_SIZE,
     REC_N_NEW_EXTRA_BYTES, REC_N_OLD_EXTRA_BYTES,
     REC_OFFS_SQL_NULL, REC_OFFS_EXTERNAL,
-    REC_INFO_DELETED_FLAG,
+    REC_INFO_DELETED_FLAG, REC_INFO_MIN_REC_FLAG,
     REC_STATUS_ORDINARY,
     PAGE_NEW_INFIMUM_OFFSET, PAGE_NEW_SUPREMUM_OFFSET,
     INFIMUM_DATA, SUPREMUM_DATA,
@@ -328,65 +328,79 @@ def parse_record_compact(page: bytes, origin: int, fields: List[FieldDefinition]
     """
     Parse a COMPACT/DYNAMIC format record from a page.
 
-    In COMPACT format record layout:
-    - Variable-length field lengths (1 or 2 bytes each, stored before null bitmap)
-    - NULL bitmap (1 bit per nullable field)
-    - Record header (REC_N_NEW_EXTRA_BYTES = 5 bytes: info_bits, n_owned, heap_no, status)
-    - Field data (in column order)
-    - For clustered index: trx_id (6 bytes) + roll_ptr (7 bytes) after primary key
+    In MySQL 8.0 COMPACT format, the record layout (growing backwards from origin):
+    - Variable-length field lengths (1 or 2 bytes each)
+    - NULL bitmap (1 bit per nullable field, growing backwards)
+    - Extra bytes (5 bytes at rec-5..rec-1):
+      rec-5: [INFO_BITS(upper nibble, 4 bits)] [N_OWNED(lower nibble, 4 bits)]
+      rec-4..rec-3: [HEAP_NO(13 bits)] [STATUS(3 bits in low bits of rec-3)]
+      rec-2..rec-1: [NEXT_RECORD(16-bit signed offset from origin)]
+    - Field data (at origin, in column order)
+    - For clustered index: trx_id (6 bytes) + roll_ptr (7 bytes) after user fields
+
+    The origin (rec) points to the start of field data.
+    NULL bitmap and var lengths are stored BEFORE the extra bytes.
     """
     n_fields = len(fields)
     n_nullable = sum(1 for f in fields if f.is_nullable)
-    n_var_fields = sum(1 for f in fields if f.is_variable)
 
     try:
-        # Calculate positions relative to the record origin
-        # REC_N_NEW_EXTRA_BYTES = 5 bytes before origin
-        extra_start = origin - REC_N_NEW_EXTRA_BYTES
+        # ============================================================
+        # Read info_bits and deleted flag
+        # INFO_BITS is in the upper nibble of byte at rec-5
+        # From MySQL 8.0 source: rec_get_bit_field_1(rec, 5, 0xF0, 0)
+        # ============================================================
+        info_bits_byte = page[origin - REC_N_NEW_EXTRA_BYTES]
+        info_bits = info_bits_byte & 0xF0  # Upper nibble = info bits
+        deleted = bool(info_bits & REC_INFO_DELETED_FLAG)  # 0x20
 
-        # Info bits at extra_start
-        info_bits = page[extra_start]
-        deleted = bool(info_bits & REC_INFO_DELETED_FLAG)
-
-        # Null bitmap: located before the extra bytes
+        # ============================================================
+        # Compute NULL bitmap and variable-length lengths positions
+        # From MySQL 8.0 source (rec.cc):
+        #   nulls = rec - (REC_N_NEW_EXTRA_BYTES + 1)
+        #   lens = nulls - UT_BITS_IN_BYTES(nullable_cols)
+        # NULL bitmap grows backwards from nulls pointer
+        # Var lengths grow backwards from lens pointer
+        # ============================================================
         null_bitmap_size = (n_nullable + 7) // 8
-        null_bitmap_start = extra_start - 1  # Last null byte
-        null_bitmap_bytes_start = null_bitmap_start - null_bitmap_size + 1
+        # nulls pointer starts at rec-6 (the LAST byte of the null bitmap)
+        # and reads backward for each new byte
+        nulls_start = origin - (REC_N_NEW_EXTRA_BYTES + 1)  # = origin - 6
+        # lens pointer starts BEFORE the null bitmap, growing backward
+        lens_start = nulls_start - null_bitmap_size  # First var len byte
 
-        # Variable-length field lengths: before null bitmap
-        lens_start = null_bitmap_bytes_start - 1  # Start from last byte going backwards
-
-        # Read field offsets
+        # ============================================================
+        # Read NULL bitmap and variable-length field lengths
+        # Mimicking MySQL 8.0 rec_init_offsets_comp_ordinary logic
+        # ============================================================
         field_offsets = []
-        current_offset = 0
+        cumulative_offset = 0
         lens_ptr = lens_start
 
-        # Read null bitmap
-        null_flags = {}
-        null_mask = 1
-        null_byte_offset = null_bitmap_bytes_start
+        # NULL bitmap: read backwards (like InnoDB: nulls--)
+        # For each nullable field, check the corresponding bit
+        null_byte_ptr = nulls_start  # Start from the LAST null byte (closest to rec)
+        null_mask = 1  # Start at bit 0
 
         for i in range(n_fields):
             field = fields[i]
 
-            # Check NULL
+            # Check NULL status
             if field.is_nullable:
-                if null_mask == 1:
-                    if null_byte_offset < 0 or null_byte_offset >= len(page):
-                        return None
-                    current_null_byte = page[null_byte_offset]
-                    null_byte_offset += 1
-                    null_mask = 256
+                # Check if null_mask has overflowed past a byte
+                if (null_mask & 0xFF) == 0:
+                    null_byte_ptr -= 1  # Move backward to next null byte
+                    null_mask = 1
 
-                is_null = bool(current_null_byte & (null_mask >> 8))
+                if null_byte_ptr < 0 or null_byte_ptr >= len(page):
+                    return None
+
+                is_null = bool(page[null_byte_ptr] & null_mask)
                 null_mask <<= 1
 
                 if is_null:
-                    null_flags[i] = True
-                    field_offsets.append(REC_OFFS_SQL_NULL)
+                    field_offsets.append(cumulative_offset | REC_OFFS_SQL_NULL)
                     continue
-
-                null_flags[i] = False
 
             # Variable-length field: read length
             if field.is_variable:
@@ -394,24 +408,26 @@ def parse_record_compact(page: bytes, origin: int, fields: List[FieldDefinition]
                     return None
 
                 len_byte = page[lens_ptr]
-                lens_ptr -= 1
+                lens_ptr -= 1  # Move backward (like InnoDB: *lens--)
 
-                needs_2_bytes = (field.max_length > 255 or
-                                field.mysql_type in (
-                                    MYSQL_TYPE_BLOB, MYSQL_TYPE_TINY_BLOB,
-                                    MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB,
-                                    MYSQL_TYPE_JSON, MYSQL_TYPE_GEOMETRY,
-                                ))
-
-                if needs_2_bytes:
+                # InnoDB encoding for variable-length fields:
+                # For max_length <= 255: 1 byte, value = len (0-127)
+                # For max_length > 255: 1 or 2 bytes
+                #   If len_byte & 0x80: 2-byte encoding (1exxxxxx xxxxxxxx)
+                #   Otherwise: 1-byte (value 0-127)
+                if (field.max_length > 255 or
+                    field.mysql_type in (
+                        MYSQL_TYPE_BLOB, MYSQL_TYPE_TINY_BLOB,
+                        MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB,
+                        MYSQL_TYPE_JSON, MYSQL_TYPE_GEOMETRY,
+                    )):
                     if len_byte & 0x80:
-                        # 1xxxxxxx xxxxxxxx format
+                        # 2-byte encoding: first byte has high bit set
                         second_byte = page[lens_ptr]
                         lens_ptr -= 1
-                        field_len = ((len_byte & 0x7F) << 8) | second_byte
-                        # Check for external storage flag
-                        is_external = bool(field_len & 0x4000)
-                        field_len = field_len & 0x3FFF
+                        combined = (len_byte << 8) | second_byte
+                        field_len = combined & 0x3FFF  # Lower 14 bits = length
+                        is_external = bool(combined & 0x4000)  # External storage flag
                     else:
                         field_len = len_byte
                         is_external = False
@@ -419,23 +435,28 @@ def parse_record_compact(page: bytes, origin: int, fields: List[FieldDefinition]
                     field_len = len_byte
                     is_external = False
 
-                current_offset += field_len
+                cumulative_offset += field_len
                 if is_external:
-                    field_offsets.append(current_offset | REC_OFFS_EXTERNAL)
+                    field_offsets.append(cumulative_offset | REC_OFFS_EXTERNAL)
                 else:
-                    field_offsets.append(current_offset)
+                    field_offsets.append(cumulative_offset)
             else:
                 # Fixed-length field
-                current_offset += field.fixed_length
-                field_offsets.append(current_offset)
+                cumulative_offset += field.fixed_length
+                field_offsets.append(cumulative_offset)
 
-        # Parse field data
+        # ============================================================
+        # Parse field data using cumulative offsets
+        # offsets[i] = cumulative end offset of field i
+        # Field i data starts at (offsets[i-1] or 0) and has length = offsets[i] - prev
+        # ============================================================
         record = ParsedRecord(
             page_offset=origin,
             deleted=deleted,
         )
 
         data_pos = origin  # Start of field data
+        prev_offset = 0
 
         for i, field in enumerate(fields):
             if i >= len(field_offsets):
@@ -446,19 +467,20 @@ def parse_record_compact(page: bytes, origin: int, fields: List[FieldDefinition]
             if offset_val & REC_OFFS_SQL_NULL:
                 record.field_values[field.name] = None
                 record.null_fields.append(field.name)
+                prev_offset = offset_val & ~REC_OFFS_SQL_NULL
                 continue
 
             is_external = bool(offset_val & REC_OFFS_EXTERNAL)
-            data_len = offset_val & 0x3FFF
+            data_len = offset_val - prev_offset
+            prev_offset = offset_val
 
-            if data_pos + data_len > UNIV_PAGE_SIZE:
+            if data_pos + data_len > UNIV_PAGE_SIZE or data_len <= 0:
                 break
 
             raw_data = page[data_pos:data_pos + data_len]
 
             if is_external:
                 record.external_fields.append(field.name)
-                # For external data, we store a marker
                 record.field_values[field.name] = f'[EXTERNAL:{data_len}B]'
                 record.field_raw[field.name] = raw_data
             else:
@@ -468,15 +490,12 @@ def parse_record_compact(page: bytes, origin: int, fields: List[FieldDefinition]
 
             data_pos += data_len
 
-        # For clustered index: parse trx_id and roll_ptr after data fields
+        # For clustered index: parse trx_id and roll_ptr after user fields
         if is_clustered and data_pos + 13 <= origin + 8000:
-            # trx_id is 6 bytes
             if data_pos + 6 <= UNIV_PAGE_SIZE:
-                record.trx_id = mach_read_from_6(page, data_pos) if data_pos + 6 <= UNIV_PAGE_SIZE else 0
+                record.trx_id = mach_read_from_6(page, data_pos)
                 data_pos += 6
-            # roll_ptr is 7 bytes
             if data_pos + 7 <= UNIV_PAGE_SIZE:
-                record.roll_ptr = 0  # Simplified
                 data_pos += 7
 
         return record

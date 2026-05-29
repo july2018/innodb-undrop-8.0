@@ -182,8 +182,23 @@ REC_1BYTE_SQL_NULL_MASK = 0x80
 REC_2BYTE_SQL_NULL_MASK = 0x8000
 REC_2BYTE_EXTERN_MASK = 0x4000
 
-# Delete flag in record info_bits
-REC_INFO_DELETED_FLAG = 0x01  # Set if record is delete-marked
+# Info bits flags in record header (upper nibble of byte at rec-5 in compact format)
+# From MySQL 8.0: storage/innobase/rem/rec.h
+# REC_NEW_INFO_BITS = 5 (offset from rec), mask = 0xF0, shift = 0
+# Info bits = page[rec-5] & 0xF0 (upper nibble)
+# N_OWNED = page[rec-5] & 0x0F (lower nibble, shared byte with INFO_BITS)
+REC_INFO_DELETED_FLAG = 0x20     # Delete-marked flag (bit 5 of byte at rec-5)
+REC_INFO_MIN_REC_FLAG = 0x10      # Minimum record in index page
+REC_INFO_INSTANT_FLAG = 0x80      # Instant ADD COLUMN flag
+REC_INFO_VERSION_FLAG = 0x40      # Record has version
+
+# Record header field offsets from rec (going backwards)
+# From MySQL 8.0: storage/innobase/rem/rec.h
+REC_NEXT = 2            # Next record offset (2 bytes at rec-2..rec-1)
+REC_NEW_HEAP_NO = 4      # Heap number (13 bits, 2 bytes at rec-4..rec-3)
+REC_NEW_N_OWNED = 5      # N_OWNED (4 bits in lower nibble of byte at rec-5)
+REC_NEW_INFO_BITS = 5    # Info bits (4 bits in upper nibble of byte at rec-5)
+REC_NEW_STATUS = 3       # Record status (3 bits in lower 3 bits of byte at rec-3)
 
 # ============================================================
 # InnoDB Data Types

@@ -15,6 +15,7 @@ from utils.config import (
     PAGE_LEVEL, PAGE_N_HEAP,
     PAGE_HEADER, PAGE_GARBAGE, PAGE_FREE, PAGE_N_RECS,
     REC_N_NEW_EXTRA_BYTES,
+    REC_INFO_DELETED_FLAG,
 )
 from parser.checksum import mach_read_from_2, mach_read_from_4, mach_read_from_8
 from parser.page_scanner import (
@@ -235,10 +236,12 @@ def _parse_page_records(result: RecoveryResult, page: InnoDBPage,
         visited.add(current)
 
         try:
-            # Get record info bits
+            # Get record info bits (deleted flag)
+            # In MySQL 8.0 compact format: info_bits is upper nibble of byte at rec-5
+            # REC_INFO_DELETED_FLAG = 0x20 (bit 5 of byte at current-5)
             extra_start = current - REC_N_NEW_EXTRA_BYTES
-            info_bits = page.raw_data[extra_start]
-            deleted = bool(info_bits & 0x01)
+            info_bits = page.raw_data[extra_start] & 0xF0
+            deleted = bool(info_bits & REC_INFO_DELETED_FLAG)
 
             if deleted_only and not deleted:
                 # Skip non-deleted records
